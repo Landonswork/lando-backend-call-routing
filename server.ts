@@ -18,7 +18,6 @@ app.use(express.urlencoded({ extended: true }));
 // ===== CONFIGURATION =====
 const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID || '';
 const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN || '';
-const TWILIO_PHONE_NUMBER = process.env.TWILIO_PHONE_NUMBER || '';
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || '';
 
 const twilioClient = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
@@ -26,6 +25,7 @@ const anthropic = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
 
 // ===== TECH MAPPINGS =====
 interface TechMapping {
+  id: string;
   name: string;
   twilioNumber: string;
   personalPhone: string;
@@ -35,16 +35,26 @@ interface TechMapping {
 
 const techMappings: Record<string, TechMapping> = {
   jacob: {
+    id: 'jacob',
     name: 'Jacob',
-    twilioNumber: '+1-205-729-7799',
+    twilioNumber: process.env.JACOB_TWILIO_NUMBER || '+1-205-729-7799',
     personalPhone: process.env.JACOB_PERSONAL_PHONE || '+1-205-555-0001',
     businessHoursStart: 7,
     businessHoursEnd: 19,
   },
   scott: {
+    id: 'scott',
     name: 'Scott',
-    twilioNumber: '+1-205-729-7800',
+    twilioNumber: process.env.SCOTT_TWILIO_NUMBER || '+1-205-729-7800',
     personalPhone: process.env.SCOTT_PERSONAL_PHONE || '+1-205-555-0002',
+    businessHoursStart: 7,
+    businessHoursEnd: 19,
+  },
+  landon: {
+    id: 'landon',
+    name: 'Landon',
+    twilioNumber: process.env.LANDON_TWILIO_NUMBER || '+1-205-729-7801',
+    personalPhone: process.env.LANDON_PERSONAL_PHONE || '+1-205-555-0003',
     businessHoursStart: 7,
     businessHoursEnd: 19,
   },
@@ -67,6 +77,10 @@ function getTechByTwilioNumber(twilioNumber: string): TechMapping | null {
   return null;
 }
 
+function getTechById(techId: string): TechMapping | null {
+  return techMappings[techId] || null;
+}
+
 // ===== API ENDPOINTS =====
 
 // Health check
@@ -76,12 +90,19 @@ app.get('/health', (req, res) => {
     timestamp: new Date().toISOString(),
     service: 'lando-backend-call-routing',
     version: '1.0.0',
+    environment: process.env.NODE_ENV || 'development',
   });
 });
 
 // Get all tech mappings
 app.get('/api/admin/tech-mappings', (req, res) => {
-  res.json(techMappings);
+  const safeMapping = Object.entries(techMappings).map(([key, tech]) => ({
+    id: tech.id,
+    name: tech.name,
+    twilioNumber: tech.twilioNumber,
+    businessHours: `${tech.businessHoursStart}AM - ${tech.businessHoursEnd}PM`,
+  }));
+  res.json(safeMapping);
 });
 
 // Incoming call handler
@@ -106,15 +127,17 @@ app.post('/api/twilio/incoming-call', (req, res) => {
 
   if (inBusinessHours) {
     // Forward to tech's personal phone
+    console.log(`✅ Business hours - forwarding ${From} to ${tech.name} at ${tech.personalPhone}`);
     twiml += `
   <Dial>
     <Number>${tech.personalPhone}</Number>
   </Dial>`;
   } else {
     // Outside business hours - voicemail
+    console.log(`🌙 Outside business hours - ${From} sent to voicemail`);
     twiml += `
-  <Say voice="alice">You've reached ${tech.name}. The office is currently closed. Please leave a message after the beep.</Say>
-  <Record maxLength="120" />`;
+  <Say voice="alice">You've reached ${tech.name}. The office is currently closed. Please leave a message and your phone number after the beep, and we'll get back to you as soon as possible.</Say>
+  <Record maxLength="120" transcribe="true" />`;
   }
 
   twiml += `
@@ -125,77 +148,94 @@ app.post('/api/twilio/incoming-call', (req, res) => {
 
 // Call completed handler
 app.post('/api/twilio/call-completed', async (req, res) => {
-  const { CallSid, From, To, RecordingUrl, CallDuration } = req.body;
+  const { CallSid, From, To, RecordingUrl, CallDuration, TranscriptionText } = req.body;
 
   console.log(`✅ Call completed: ${CallSid}`);
   console.log(`   Duration: ${CallDuration} seconds`);
+  console.log(`   From: ${From}`);
+  console.log(`   To: ${To}`);
 
   try {
+    const tech = getTechByTwilioNumber(To);
+    
+    if (!tech) {
+      console.error(`⚠️ Tech not found for number: ${To}`);
+      return res.status(404).json({ error: 'Tech not found' });
+    }
+
     if (RecordingUrl) {
-      console.log(`📥 Downloading recording: ${RecordingUrl}`);
+      console.log(`📥 Processing recording: ${RecordingUrl}`);
 
-      // Download recording
-      const recordingResponse = await axios.get(RecordingUrl, {
-        auth: {
-          username: process.env.TWILIO_ACCOUNT_SID || '',
-          password: process.env.TWILIO_AUTH_TOKEN || '',
-        },
-        responseType: 'arraybuffer',
-      });
+      let transcription = TranscriptionText || 'No transcription available';
 
-      // Save locally (for testing)
-      const recordingPath = path.join(process.cwd(), `recording_${CallSid}.wav`);
-      fs.writeFileSync(recordingPath, recordingResponse.data);
-      console.log(`💾 Recording saved: ${recordingPath}`);
+      // If no transcription from Twilio, try Claude
+      if (!TranscriptionText && RecordingUrl) {
+        try {
+          const recordingResponse = await axios.get(RecordingUrl, {
+            auth: {
+              username: TWILIO_ACCOUNT_SID,
+              password: TWILIO_AUTH_TOKEN,
+            },
+            responseType: 'arraybuffer',
+          });
 
-      // Send to Claude for transcription
-      console.log(`🤖 Sending to Claude for transcription...`);
+          const base64Audio = Buffer.from(recordingResponse.data).toString('base64');
 
-      const base64Audio = Buffer.from(recordingResponse.data).toString('base64');
+          console.log(`🤖 Sending to Claude for transcription...`);
 
-      const response = await anthropic.messages.create({
-        model: 'claude-3-5-sonnet-20241022',
-        max_tokens: 1024,
-        messages: [
-          {
-            role: 'user',
-            content: [
+          const response = await anthropic.messages.create({
+            model: 'claude-3-5-sonnet-20241022',
+            max_tokens: 1024,
+            messages: [
               {
-                type: 'text',
-                text: 'Please transcribe this phone call recording and provide a brief summary of what was discussed.',
-              },
-              {
-                type: 'image',
-                source: {
-                  type: 'base64',
-                  media_type: 'audio/wav',
-                  data: base64Audio,
-                },
+                role: 'user',
+                content: [
+                  {
+                    type: 'text',
+                    text: 'Please transcribe this phone call recording and provide a brief summary of what was discussed.',
+                  },
+                  {
+                    type: 'image',
+                    source: {
+                      type: 'base64',
+                      media_type: 'audio/wav',
+                      data: base64Audio,
+                    },
+                  },
+                ],
               },
             ],
-          },
-        ],
-      });
+          });
 
-      const transcription =
-        response.content[0].type === 'text' ? response.content[0].text : 'Unable to transcribe';
-
-      console.log(`📝 Transcription: ${transcription.substring(0, 100)}...`);
+          transcription =
+            response.content[0].type === 'text'
+              ? response.content[0].text
+              : 'Unable to transcribe';
+        } catch (error) {
+          console.error('⚠️ Error with Claude transcription:', error);
+          transcription = 'Transcription failed';
+        }
+      }
 
       // Log call data
       const callData = {
         callSid: CallSid,
+        tech: tech.name,
         from: From,
         to: To,
         duration: CallDuration,
         timestamp: new Date().toISOString(),
         transcription: transcription,
+        recordingUrl: RecordingUrl,
       };
 
       console.log(`📋 Call logged:`, callData);
-    }
 
-    res.json({ status: 'recorded', callSid: CallSid });
+      res.json({ status: 'recorded', callSid: CallSid, transcription: transcription });
+    } else {
+      console.log(`ℹ️ No recording for call: ${CallSid}`);
+      res.json({ status: 'completed', callSid: CallSid });
+    }
   } catch (error) {
     console.error('❌ Error processing call:', error);
     res.status(500).json({ error: 'Failed to process call' });
@@ -206,7 +246,9 @@ app.post('/api/twilio/call-completed', async (req, res) => {
 app.post('/api/webrtc/start-call', async (req, res) => {
   const { customerPhone, techId } = req.body;
 
-  const tech = techMappings[techId];
+  console.log(`📞 WebRTC call request: ${customerPhone} to ${techId}`);
+
+  const tech = getTechById(techId);
   if (!tech) {
     return res.status(404).json({ error: 'Tech not found' });
   }
@@ -219,9 +261,12 @@ app.post('/api/webrtc/start-call', async (req, res) => {
       url: `${process.env.RAILWAY_WEBHOOK_URL || 'http://localhost:5000'}/api/twilio/incoming-call`,
     });
 
+    console.log(`✅ Call initiated: ${call.sid}`);
+
     res.json({
       status: 'call_initiated',
       callSid: call.sid,
+      techName: tech.name,
     });
   } catch (error) {
     console.error('❌ Error initiating call:', error);
@@ -236,8 +281,14 @@ app.listen(PORT, () => {
 ║  🎙️  LANDO BACKEND - CALL ROUTING      ║
 ║  Port: ${PORT}                             ║
 ║  Status: ✅ Running                     ║
+║  Railway URL: ${process.env.RAILWAY_WEBHOOK_URL || 'http://localhost:5000'}
 ╚════════════════════════════════════════╝
   `);
+
+  console.log('\n📱 Tech Mappings:');
+  Object.values(techMappings).forEach(tech => {
+    console.log(`   ${tech.name}: ${tech.twilioNumber} → ${tech.personalPhone}`);
+  });
 });
 
 export default app;
