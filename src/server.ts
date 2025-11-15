@@ -189,20 +189,7 @@ app.post('/api/twilio/call-completed', async (req, res) => {
             messages: [
               {
                 role: 'user',
-                content: [
-                  {
-                    type: 'text',
-                    text: 'Please transcribe this phone call recording and provide a brief summary of what was discussed.',
-                  },
-                  {
-                    type: 'image',
-                    source: {
-                      type: 'base64',
-                      media_type: 'audio/wav',
-                      data: base64Audio,
-                    },
-                  },
-                ],
+                content: `This is a base64-encoded WAV audio file from a phone call. Please transcribe it and provide a brief summary of what was discussed.\n\nAudio (base64): ${base64Audio}`,
               },
             ],
           });
