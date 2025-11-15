@@ -5,7 +5,7 @@
   "main": "dist/server.js",
   "scripts": {
     "dev": "ts-node src/server.ts",
-    "build": "tsc",
+    "build": "tsc --listFiles",
     "start": "npm run build && node dist/server.js"
   },
   "dependencies": {
