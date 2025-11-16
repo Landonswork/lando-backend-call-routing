@@ -1,0 +1,8 @@
+{
+  "build": {
+    "builder": "nixpacks"
+  },
+  "deploy": {
+    "startCommand": "cd src && npm install && npm start"
+  }
+}
