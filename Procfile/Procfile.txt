@@ -1,0 +1,2 @@
+web: cd src && node server.js
+gateway: cd twilio-voice-gateway && node index.js
