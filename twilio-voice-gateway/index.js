@@ -6,7 +6,7 @@ const WebSocket = require('ws');
 const { GoogleGenAI, Modality, Type } = require('@google/genai');
 const { Twilio } = require('twilio');
 const TwiML = Twilio.twiml;
-const MessagingResponse = TwiML.MessagingResponse;
+const MessagingResponse = Twilio.TwimL.MessagingResponse;
 const fetch = require('node-fetch');
 
 // --- Configuration ---
