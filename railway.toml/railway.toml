@@ -1,0 +1,17 @@
+[build]
+builder = "nixpacks"
+
+[deploy]
+startCommand = "npm run start"
+restartPolicyType = "on_failure"
+restartPolicyMaxRetries = 3
+
+[[services]]
+name = "backend"
+startCommand = "cd src && npm install && npm run start"
+port = 8080
+
+[[services]]
+name = "voice-gateway"
+startCommand = "cd twilio-voice-gateway && npm install && npm start"
+port = 3000
