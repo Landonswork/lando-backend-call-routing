@@ -6,6 +6,7 @@ const WebSocket = require('ws');
 const { GoogleGenAI, Modality, Type } = require('@google/genai');
 const { Twilio } = require('twilio');
 const TwiML = Twilio.twiml;
+const MessagingResponse = TwiML.MessagingResponse;
 const fetch = require('node-fetch');
 
 // --- Configuration ---
@@ -28,6 +29,7 @@ app.use(express.urlencoded({ extended: true }));
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 const callbackTimers = {}; // Store setTimeout IDs for callbacks
+const smsChatSessions = new Map(); // Store chat sessions for SMS
 
 // --- Business Hours Check (Consistent with Web App) ---
 const BUSINESS_HOURS = {
@@ -56,11 +58,11 @@ const TECH_LINES = {
 };
 
 const LANDO_SYSTEM_PROMPT = `
-You are Lando, a friendly, compassionate, and highly efficient virtual assistant for Landon's Mailbox Service. You are in a real-time voice conversation, so keep your responses concise and natural-sounding. Your goal is to provide excellent customer service by determining if a customer is new or returning, routing returning customers, and preparing work orders for new customers.
+You are Lando, a friendly, compassionate, and highly efficient virtual assistant for Landon's Mailbox Service. You are in a real-time voice or text conversation, so keep your responses concise and natural-sounding. Your goal is to provide excellent customer service by determining if a customer is new or returning, routing returning customers, and preparing work orders for new customers.
 
 **Your Persona:**
-- Always be kind, helpful, and patient.
-- **Speak at a relaxed, friendly pace.** Enunciate your words clearly. Imagine you're having a pleasant chat on a sunny afternoon in Alabama.
+- Always be kind, helpful, and patient. Your voice should be warm and welcoming.
+- **For voice, speak slowly and clearly, at a relaxed, friendly pace.** Enunciate your words. Imagine you're having a pleasant, unhurried chat on a sunny afternoon in Alabama with a neighbor. This is very important for our customers.
 - **Pacing is key:** Ask for only ONE piece of information at a time (e.g., first name, then wait for a response before asking for last name). This ensures a smooth voice conversation.
 - **Tool Use Language:** Before you use a tool, use a natural filler phrase to let the user know you're working on their request. Examples: "Okay, one moment while I look that up for you," or "Let me just pull up that information," or "Sure, I can create that work order for you right now."
 
@@ -87,7 +89,7 @@ You are Lando, a friendly, compassionate, and highly efficient virtual assistant
         - If DURING BUSINESS HOURS: Say "Perfect! Let me look up your work order and connect you." Use the \`lookup_work_order\` tool, followed by the \`route_to_technician\` tool.
     3.  If NO: Treat it as a new customer call and switch to the "New Customer Workflow."
 - **Main Line Call (New Customer Workflow):**
-    - You can accept new work orders via phone 24/7. The business hours check does not apply to new customers on the main line.
+    - You can accept new work orders via phone or text 24/7. The business hours check does not apply to new customers on the main line.
     1.  **Greet:** Start with a warm greeting: "Hi there! Welcome to Landon's Mailbox Service. My name is Lando, how can I help you today?"
     2.  **Identify Service & Area:** Determine the service needed (Refresh, Repair, Replacement, Vinyl) and confirm they are in our service area (Birmingham metro, Auburn, Opelika, Alexander City, Lake Martin).
     3.  **Provide Pricing:** State upfront prices where available ($65 Mailbox Refresh, $55 Sign Refresh, $100 basic weld repair). For others, state that photos are required for an accurate quote.
@@ -99,25 +101,25 @@ You are Lando, a friendly, compassionate, and highly efficient virtual assistant
         - Preferred Communication Method (Phone Call or Text).
     5.  **Get Zip (Automated):** After getting the address, you MUST use the \`get_zipcode_for_address\` tool.
     6.  **Confirm Contact Details (CRITICAL):**
-        - Read the phone number back to the customer.
-        - SPELL OUT the email address (e.g., "s-m-i-t-h at gmail dot com"). Do not proceed without confirmation.
+        - For voice, read the phone number back and SPELL OUT the email address (e.g., "s-m-i-t-h at gmail dot com").
+        - For text, just re-state the email address for confirmation.
     7.  **Create Work Order:** You MUST call the \`create_work_order\` function with all collected details.
     8.  **Inform & Send Link:** After the tool returns a \`tracking_code\` and \`folder_link\`, tell the customer their tracking code. Then ask if they'd prefer the photo upload link via text or email. Use the \`send_sms\` tool if they choose text.
-    9.  **Disclaimer & Close:** Recite the professional liability disclaimer and end the call professionally.
+    9.  **Disclaimer & Close:** Share the professional liability disclaimer and end the conversation professionally.
 
 **Function Tools:**
 *   \`get_zipcode_for_address\`: Finds a zip code from an address.
 *   \`create_work_order\`: Creates a new job in the system.
 *   \`send_sms\`: Sends a text message to a customer.
 *   \`lookup_work_order\`: Finds an existing work order.
-*   \`route_to_technician\`: Transfers a call to a technician.
+*   \`route_to_technician\`: Transfers a call to a technician (voice only).
 
 **Crucial Company Policies:**
 *   **APPOINTMENTS:** We don't schedule exact appointments. We are a small, family-run business and complete most jobs within 10 days.
 *   **PAYMENT:** For Refresh/Repair, payment is due after work is complete via an emailed invoice. Vinyl numbers require upfront payment.
 *   **FORM FALLBACK:** If a user prefers a form, offer to text them the link to \`https://www.landonsmailbox.com/request-service\` using the \`send_sms\` tool.
 
-**Professional Liability Disclaimer (read before ending the call):**
+**Professional Liability Disclaimer (share before ending the conversation):**
 "Before we wrap up, I want to share something important. Landon's Mailbox Service takes great care during our work, but there's a possibility that nearby items like plants, yard ornaments, or vehicles could be affected by damage or overspray. We cannot be responsible for these items, and anything that needs to be moved should be handled by you before our team arrives. We'll coordinate timing with you to make sure everything works smoothly. Does that all make sense?"
 `;
 
@@ -285,146 +287,119 @@ app.post("/outbound-call", (req, res) => {
     res.send(twiml.toString());
 });
 
-// --- SMS Conversation Store ---
-const smsConversations = {}; // Store active SMS conversations by phone number
 
 // --- Twilio Webhook for Incoming SMS ---
 app.post("/incoming-sms", async (req, res) => {
-    const customerPhoneNumber = req.body.From;
-    const incomingMessage = req.body.Body;
-    const dialedPhoneNumber = req.body.To;
+    const from = req.body.From;
+    const body = req.body.Body;
+    console.log(`Incoming SMS from ${from}: "${body}"`);
+
+    let chat = smsChatSessions.get(from);
+    if (!chat) {
+        console.log(`New SMS conversation with ${from}`);
+        chat = ai.chats.create({
+            model: 'gemini-2.5-flash',
+            config: {
+                systemInstruction: LANDO_SYSTEM_PROMPT,
+                tools: [{ functionDeclarations: [createWorkOrderTool, sendSmsTool, getZipcodeForAddressTool, lookupWorkOrderTool] }], // Note: route_to_technician is voice-only
+            }
+        });
+        smsChatSessions.set(from, chat);
+    }
     
-    console.log(`Incoming SMS from: ${customerPhoneNumber} to: ${dialedPhoneNumber}, Message: "${incomingMessage}"`);
-    
+    let fullLandoResponse = "";
+
     try {
-        // Initialize conversation if first message from this customer
-        if (!smsConversations[customerPhoneNumber]) {
-            console.log(`Starting new SMS conversation with ${customerPhoneNumber}`);
-            smsConversations[customerPhoneNumber] = {
-                messages: [],
-                workOrderData: {},
-                createdAt: new Date(),
-            };
+        const stream = await chat.sendMessageStream({ message: body });
+        let landoResponseText = '';
+        let functionCalls = [];
+
+        for await (const chunk of stream) {
+            if (chunk.text) landoResponseText += chunk.text;
+            if (chunk.functionCalls) functionCalls.push(...chunk.functionCalls);
         }
         
-        const conversation = smsConversations[customerPhoneNumber];
-        
-        // Add customer message to history
-        conversation.messages.push({
-            role: 'user',
-            content: incomingMessage,
-        });
-        
-        // Check for incomplete work order from previous voice/SMS session
-        let contextMessage = '';
-        try {
-            const LOOKUP_URL = 'https://alissa-backend-20-production.up.railway.app/api/lookup-workorder';
-            const lookupResponse = await fetch(LOOKUP_URL, {
+        if (landoResponseText) {
+            fullLandoResponse += landoResponseText;
+        }
+
+        if (functionCalls.length > 0) {
+            const toolResults = [];
+            for (const fc of functionCalls) {
+                // We handle SMS tool calls separately as they are not real-time like voice
+                const result = await handleSmsToolCall(fc);
+                toolResults.push(result);
+            }
+
+            const toolResponseStream = await chat.sendMessageStream({ parts: toolResults });
+            let finalLandoText = '';
+            for await (const chunk of toolResponseStream) {
+                if (chunk.text) finalLandoText += chunk.text;
+            }
+            if (finalLandoText) {
+                if (fullLandoResponse) fullLandoResponse += "\n\n"; // Add spacing if there was a preliminary text response
+                fullLandoResponse += finalLandoText;
+            }
+        }
+    } catch (error) {
+        console.error("Error processing SMS with Gemini:", error);
+        fullLandoResponse = "Sorry, I'm having a little trouble right now. Please try again in a moment.";
+    }
+
+    const twiml = new MessagingResponse();
+    if (fullLandoResponse.trim()) {
+        twiml.message(fullLandoResponse.trim());
+    } else {
+        // If Lando gives no response (e.g., after only a tool call), don't send an empty message.
+        console.log("Lando produced no text response for SMS.");
+    }
+    
+    res.type('text/xml');
+    res.send(twiml.toString());
+});
+
+// --- SMS Tool Call Handler ---
+async function handleSmsToolCall(functionCall) {
+    const { name, args } = functionCall;
+    let functionResponsePayload;
+    console.log(`[SMS] Calling tool ${name} with args:`, args);
+
+    try {
+        const endpointMap = {
+            send_sms: 'https://lando-sms-sender-j7v2k72qha-uc.a.run.app/sendSms',
+            create_work_order: 'https://alissa-backend-20-production.up.railway.app/api/create-workorder',
+            get_zipcode_for_address: 'https://alissa-backend-20-production.up.railway.app/api/get-zipcode',
+            lookup_work_order: 'https://alissa-backend-20-production.up.railway.app/api/lookup-workorder',
+        };
+        const endpoint = endpointMap[name];
+
+        if (endpoint) {
+            const response = await fetch(endpoint, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ phone: customerPhoneNumber }),
+                body: JSON.stringify(args),
             });
-            if (lookupResponse.ok) {
-                const incompleteOrder = await lookupResponse.json();
-                if (incompleteOrder && incompleteOrder.status === 'incomplete') {
-                    console.log(`Found incomplete work order for SMS customer: ${customerPhoneNumber}`);
-                    contextMessage = `[CONTEXT: This customer has an incomplete work order with previously gathered info: ${JSON.stringify(incompleteOrder)}. Resume from where you left off.]\n\n`;
-                    conversation.workOrderData = incompleteOrder;
-                }
+
+            if (!response.ok) {
+                 const errorText = await response.text();
+                 throw new Error(`HTTP error calling tool ${name}! status: ${response.status}, body: ${errorText}`);
             }
-        } catch (lookupError) {
-            console.error("Failed to lookup incomplete SMS work order:", lookupError.message);
-        }
-        
-        // Determine which number was dialed to set context
-        let systemContext = "SYSTEM_NOTE: This is an SMS conversation. Keep responses concise (1-2 sentences per message). ";
-        const isTechLine = Object.keys(TECH_LINES).some(line => dialedPhoneNumber.endsWith(line));
-        
-        if (isTechLine) {
-            systemContext += "This is a tech line SMS. ";
-            if (isDuringBusinessHours()) {
-                systemContext += "It's during business hours. Follow tech line routing logic if appropriate.";
-            } else {
-                systemContext += "It's after business hours. Acknowledge and inform them a tech will respond the next business day.";
-            }
+            functionResponsePayload = await response.json();
         } else {
-            systemContext += "This is the main line SMS. Follow the 'Main Line Call' workflow for new customer orders.";
+            throw new Error(`Unknown or unsupported tool for SMS: ${name}`);
         }
-        
-        // Build conversation history for Gemini
-        const conversationHistory = [
-            {
-                role: 'user',
-                content: systemContext + "\n\n" + contextMessage + LANDO_SYSTEM_PROMPT,
-            }
-        ];
-        
-        // Add all previous messages in this SMS session
-        for (const msg of conversation.messages) {
-            conversationHistory.push(msg);
-        }
-        
-        console.log(`Sending SMS conversation to Gemini with ${conversation.messages.length} messages...`);
-        
-        // Get response from Gemini text API
-        const geminiResponse = await ai.models.generateContent({
-            model: 'gemini-2.5-flash',
-            contents: conversationHistory,
-        });
-        
-        const assistantMessage = geminiResponse.text;
-        console.log(`Gemini SMS response: "${assistantMessage}"`);
-        
-        // Add assistant response to conversation history
-        conversation.messages.push({
-            role: 'model',
-            content: assistantMessage,
-        });
-        
-        // Send SMS response back to customer
-        try {
-            const smsResponse = await twilioClient.messages.create({
-                body: assistantMessage,
-                from: TWILIO_PHONE_NUMBER,
-                to: customerPhoneNumber,
-            });
-            console.log(`SMS sent to ${customerPhoneNumber}. SID: ${smsResponse.sid}`);
-        } catch (smsError) {
-            console.error(`Failed to send SMS response to ${customerPhoneNumber}:`, smsError.message);
-        }
-        
-        // Cleanup old conversations (older than 24 hours)
-        const now = new Date();
-        for (const [phone, conv] of Object.entries(smsConversations)) {
-            const age = now - conv.createdAt;
-            if (age > 24 * 60 * 60 * 1000) {
-                console.log(`Cleaning up SMS conversation for ${phone}`);
-                delete smsConversations[phone];
-            }
-        }
-        
-        // Return empty TwiML response (SMS doesn't need TwiML response body)
-        res.type('text/xml');
-        res.send(new TwiML.MessagingResponse().toString());
-        
     } catch (error) {
-        console.error('Error handling SMS:', error.message);
-        
-        // Send error response to customer
-        try {
-            await twilioClient.messages.create({
-                body: "We're having trouble processing your message right now. Please try again in a moment.",
-                from: TWILIO_PHONE_NUMBER,
-                to: customerPhoneNumber,
-            });
-        } catch (fallbackError) {
-            console.error('Failed to send fallback SMS error message:', fallbackError.message);
-        }
-        
-        res.type('text/xml');
-        res.send(new TwiML.MessagingResponse().toString());
+        console.error(`[SMS] Error calling tool ${name}:`, error);
+        functionResponsePayload = { error: error.message };
     }
-});
+
+    return {
+        functionResponse: {
+            name,
+            response: functionResponsePayload,
+        }
+    };
+}
 
 
 // --- WebSocket Handler for Audio Streaming ---
@@ -510,7 +485,7 @@ wss.on('connection', async (ws, req) => {
       model: 'gemini-2.5-flash-native-audio-preview-09-2025',
       config: {
         responseModalities: [Modality.AUDIO],
-        speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Charon' } } },
+        speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Fenrir' } } },
         systemInstruction: systemPrompt,
         inputAudioTranscription: {},
         outputAudioTranscription: {},
