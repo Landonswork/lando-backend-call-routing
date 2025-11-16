@@ -8,10 +8,10 @@ restartPolicyMaxRetries = 3
 
 [[services]]
 name = "backend"
-startCommand = "cd src && npm install && npm run start"
+startCommand = "cd src && npm start"
 port = 8080
 
 [[services]]
 name = "voice-gateway"
-startCommand = "cd twilio-voice-gateway && npm install && npm start"
+startCommand = "cd twilio-voice-gateway && npm start"
 port = 3000
