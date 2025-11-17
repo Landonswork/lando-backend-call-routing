@@ -8,7 +8,10 @@ const TwiML = Twilio.twiml;
 const MessagingResponse = Twilio.twiml.MessagingResponse;
 const fetch = require('node-fetch');
 const nodemailer = require('nodemailer');
+<<<<<<< HEAD
 const { google } = require('googleapis');
+=======
+>>>>>>> d86a00649f0fa74da8d2fb8e81ff1c621e18a88c
 
 // --- Configuration ---
 const PORT = process.env.PORT || 8080;
@@ -763,4 +766,8 @@ server.listen(PORT, () => {
 
 Ready for calls, SMS, and emails 24/7!
   `);
+<<<<<<< HEAD
 });
+=======
+});
+>>>>>>> d86a00649f0fa74da8d2fb8e81ff1c621e18a88c
